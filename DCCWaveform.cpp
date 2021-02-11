@@ -21,8 +21,10 @@
 
 #include "DCCWaveform.h"
 #include "DIAG.h"
+
  
 const int NORMAL_SIGNAL_TIME=58;  // this is the 58uS DCC 1-bit waveform half-cycle 
+const int NORMAL_ZERO_TIME=116; // DCC 0-bit waveform half-cycle
 const int SLOW_SIGNAL_TIME=NORMAL_SIGNAL_TIME*512;
 
 DCCWaveform  DCCWaveform::mainTrack(PREAMBLE_BITS_MAIN, true);
@@ -31,32 +33,29 @@ DCCWaveform  DCCWaveform::progTrack(PREAMBLE_BITS_PROG, false);
 
 bool DCCWaveform::progTrackSyncMain=false; 
 bool DCCWaveform::progTrackBoosted=false; 
-VirtualTimer * DCCWaveform::interruptTimer=NULL;      
+//VirtualTimer * DCCWaveform::interruptTimer=NULL;      
   
 void DCCWaveform::begin(MotorDriver * mainDriver, MotorDriver * progDriver, byte timerNumber) {
+  ///////////////////////////////////////////////////////////////////////////////////////////////
   mainTrack.motorDriver=mainDriver;
-  progTrack.motorDriver=progDriver;
+  mainTrack.setPowerMode(POWERMODE::OFF);
+  // Set up pulse generator object to generate pulse train for main track.
+  mainTrack.pg.setPin(mainDriver->getSignalPin());
+  mainTrack.pg.setHandler(interruptHandlerMain);
+  mainTrack.pg.init();
 
-  mainTrack.setPowerMode(POWERMODE::OFF);      
+  progTrack.motorDriver=progDriver;
   progTrack.setPowerMode(POWERMODE::OFF);
-  switch (timerNumber) {
-    case 1: interruptTimer= &TimerA; break;
-    case 2: interruptTimer= &TimerB; break;
-#ifndef ARDUINO_AVR_UNO  
-    case 3: interruptTimer= &TimerC; break;
-#endif    
-    default:
-      DIAG(F("\n\n *** Invalid Timer number %d requested. Only 1..3 valid.  DCC will not work.*** \n\n"), timerNumber);
-      return;
-  }
-  interruptTimer->initialize();
-  interruptTimer->setPeriod(NORMAL_SIGNAL_TIME); // this is the 58uS DCC 1-bit waveform half-cycle
-  interruptTimer->attachInterrupt(interruptHandler);
-  interruptTimer->start();
+  // Set up pulse generator object to generate pulse train for prog track.
+  progTrack.pg.setPin(progDriver->getSignalPin());;
+  progTrack.pg.setHandler(interruptHandlerProg);
+  progTrack.pg.init();
+  ///////////////////////////////////////////////////////////////////////////////////////////////
 }
+
 void DCCWaveform::setDiagnosticSlowWave(bool slow) {
-  interruptTimer->setPeriod(slow? SLOW_SIGNAL_TIME : NORMAL_SIGNAL_TIME);
-  interruptTimer->start(); 
+  // interruptTimer->setPeriod(slow? SLOW_SIGNAL_TIME : NORMAL_SIGNAL_TIME);
+  // interruptTimer->start(); 
   DIAG(F("\nDCC SLOW WAVE %S\n"),slow?F("SET. DO NOT ADD LOCOS TO TRACK"):F("RESET")); 
 }
 
@@ -65,20 +64,31 @@ void DCCWaveform::loop() {
   progTrack.checkPowerOverload();
 }
 
-
+///////////////////////////////////////////////////////////////////////////////////////////////
 // static //
-void DCCWaveform::interruptHandler() {
+void DCCWaveform::interruptHandlerMain(PulseGenerator *pgx) {
   // call the timer edge sensitive actions for progtrack and maintrack
-  bool mainCall2 = mainTrack.interrupt1();
-  bool progCall2 = progTrack.interrupt1();
+  bool mainCall = mainTrack.interrupt1();
 
   // call (if necessary) the procs to get the current bits
   // these must complete within 50microsecs of the interrupt
   // but they are only called ONCE PER BIT TRANSMITTED
   // after the rising edge of the signal
-  if (mainCall2) mainTrack.interrupt2();
-  if (progCall2) progTrack.interrupt2();
+  if (mainCall) mainTrack.interrupt2();
 }
+
+// static //
+void DCCWaveform::interruptHandlerProg(PulseGenerator *pgx) {
+  // call the timer edge sensitive actions for progtrack and maintrack
+  bool progCall = progTrack.interrupt1();
+
+  // call (if necessary) the procs to get the current bits
+  // these must complete within 50microsecs of the interrupt
+  // but they are only called ONCE PER BIT TRANSMITTED
+  // after the rising edge of the signal
+  if (progCall) progTrack.interrupt2();
+}
+///////////////////////////////////////////////////////////////////////////////////////////////
 
 
 // An instance of this class handles the DCC transmissions for one track. (main or prog)
@@ -114,7 +124,7 @@ POWERMODE DCCWaveform::getPowerMode() {
 void DCCWaveform::setPowerMode(POWERMODE mode) {
 
   // Prevent power switch on with no timer... Otheruise track will get full power DC and locos will run away.  
-  if (!interruptTimer) return; 
+  //if (!interruptTimer) return; 
   
   powerMode = mode;
   bool ison = (mode == POWERMODE::ON);
@@ -177,30 +187,23 @@ void DCCWaveform::checkPowerOverload() {
 bool DCCWaveform::interrupt1() {
   // NOTE: this must consume transmission buffers even if the power is off
   // otherwise can cause hangs in main loop waiting for the pendingBuffer.
+  ///////////////////////////////////////////////////////////////////////////////////////////////
   switch (state) {
     case 0:  // start of bit transmission
-      setSignal(HIGH);
+      pg.setNextPulse(currentBit ? NORMAL_SIGNAL_TIME : NORMAL_ZERO_TIME, HIGH);
       state = 1;
-      return true; // must call interrupt2 to set currentBit
+      break;      
 
-    case 1:  // 58us after case 0
-      if (currentBit) {
-        setSignal(LOW);
-        state = 0;
-      }
-      else state = 2;
-      break;
-    case 2:  // 116us after case 0
-      setSignal(LOW);
-      state = 3;
-      break;
-    case 3:  // finished sending zero bit
+    case 1:  // 58us or 100us after case 0
+      pg.setNextPulse(currentBit ? NORMAL_SIGNAL_TIME : NORMAL_ZERO_TIME, LOW);
       state = 0;
-      break;
+
+    return true; // set currentBit for next bit to be transmitted.
+  ///////////////////////////////////////////////////////////////////////////////////////////////  
   }
 
   // ACK check is prog track only and will only be checked if 
-  // this is not case(0) which needs  relatively expensive packet change code to be called.
+  // this is not case(1) which needs  relatively expensive packet change code to be called.
   if (ackPending) checkAck();
 
   return false;
@@ -208,14 +211,14 @@ bool DCCWaveform::interrupt1() {
 }
 
 void DCCWaveform::setSignal(bool high) {
-  if (progTrackSyncMain) {
-    if (!isMainTrack) return; // ignore PROG track waveform while in sync
-    // set both tracks to same signal
-    motorDriver->setSignal(high);
-    progTrack.motorDriver->setSignal(high);
-    return;     
-  }
-  motorDriver->setSignal(high);
+  // if (progTrackSyncMain) {
+  //   if (!isMainTrack) return; // ignore PROG track waveform while in sync
+  //   // set both tracks to same signal
+  //   motorDriver->setSignal(high);
+  //   progTrack.motorDriver->setSignal(high);
+  //   return;     
+  // }
+  // motorDriver->setSignal(high);
 }
       
 void DCCWaveform::interrupt2() {

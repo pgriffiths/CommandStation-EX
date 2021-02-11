@@ -36,6 +36,7 @@ class MotorDriver {
     inline int getRawCurrentTripValue() {
 	return rawCurrentTripValue;
     }
+    int getSignalPin() { return signalPin; }
 
   private:
     byte powerPin, signalPin, signalPin2, currentPin, faultPin;

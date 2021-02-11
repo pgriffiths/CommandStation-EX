@@ -21,6 +21,7 @@
 #define DCCWaveform_h
 #include "MotorDriver.h"
 #include "ArduinoTimers.h"
+#include "PulseGenerator.h"
 
 // Wait times for power management. Unit: milliseconds
 const int  POWER_SAMPLE_ON_WAIT = 100;
@@ -88,8 +89,9 @@ class DCCWaveform {
     }
 
   private:
-    static VirtualTimer * interruptTimer;      
-    static void interruptHandler();
+    PulseGenerator pg;      
+    static void interruptHandlerMain(PulseGenerator *pgx);
+    static void interruptHandlerProg(PulseGenerator *pgx);
     bool interrupt1();
     void interrupt2();
     void checkAck();
